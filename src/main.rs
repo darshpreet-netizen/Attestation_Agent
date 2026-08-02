@@ -3,20 +3,15 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use wmi::{COMLibrary, WMIConnection};
 
 #[derive(Deserialize, Serialize, Debug)]
+#[serde(rename_all = "PascalCase")]
 struct TpmInfo {
-    #[serde(rename = "IsPresent_Valid")]
-    pub is_present_valid: bool,
-
-    #[serde(rename = "IsEnabled_Valid")]
-    pub is_enabled_valid: bool,
-
-    #[serde(rename = "ManufacturerId")]
     pub manufacturer_id: u32,
+    pub spec_version: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -29,7 +24,7 @@ struct ComputerSystem {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct AttestationReport {
-    pub payload: HashMap<String, String>,
+    pub payload: BTreeMap<String, String>,
     pub timestamp: u64,
     pub nonce_hex: String,
     pub state_sha256: String,
@@ -44,7 +39,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("[*] Collecting native WMI telemetry and generating cryptographic payload...");
 
     let com_lib = COMLibrary::new()?;
-    let mut payload = HashMap::new();
+    let mut payload = BTreeMap::new();
 
     // 1. Gather System Info via Native COM
     if let Ok(sys_con) = WMIConnection::new(com_lib) {
@@ -57,14 +52,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // 2. Gather TPM Status
+    // 2. Gather TPM Status via Native WMI Properties
     let (tpm_present, tpm_ready) = match WMIConnection::with_namespace_path(r"root\CIMV2\Security\MicrosoftTpm", com_lib) {
         Ok(tpm_con) => {
-            match tpm_con.raw_query::<TpmInfo>("SELECT IsPresent_Valid, IsEnabled_Valid, ManufacturerId FROM Win32_Tpm") {
+            match tpm_con.raw_query::<TpmInfo>("SELECT ManufacturerId, SpecVersion FROM Win32_Tpm") {
                 Ok(results) => {
                     if let Some(tpm) = results.first() {
                         payload.insert("TpmManufacturerId".to_string(), tpm.manufacturer_id.to_string());
-                        (tpm.is_present_valid, tpm.is_enabled_valid)
+                        if let Some(ref ver) = tpm.spec_version {
+                            payload.insert("TpmSpecVersion".to_string(), ver.clone());
+                        }
+                        (true, true)
                     } else {
                         (false, false)
                     }
@@ -116,9 +114,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("\n[+] Signed Attestation Report Ready.");
 
-    // 6. Transmit Report over HTTP POST to Verification Gateway
-    let gateway_url = "https://httpbin.org/post"; // Test HTTP Gateway endpoint
-    println!("[*] Transmitting attestation payload to Verification Gateway ({})", gateway_url);
+    // 6. Transmit Report over HTTP POST to Local Gateway
+    let gateway_url = "http://127.0.0.1:3000/api/v1/attest";
+    println!("[*] Transmitting attestation payload to Gateway ({})", gateway_url);
 
     let client = reqwest::Client::new();
     let response = client.post(gateway_url)
@@ -127,7 +125,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     if response.status().is_success() {
-        println!("\n[SUCCESS] Attestation Payload Accepted by Gateway! (HTTP Status: {})", response.status());
+        let body: serde_json::Value = response.json().await?;
+        println!("\n[SUCCESS] Gateway Accepted Payload!");
+        println!("[+] Response: {}", serde_json::to_string_pretty(&body)?);
     } else {
         println!("\n[ERROR] Gateway rejected attestation report. Status: {}", response.status());
     }
