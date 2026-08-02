@@ -1,8 +1,10 @@
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::rngs::OsRng;
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 use wmi::{COMLibrary, WMIConnection};
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -25,9 +27,12 @@ struct ComputerSystem {
     pub model: String,
 }
 
-#[derive(Serialize)]
+// Enterprise Attestation Report with Anti-Replay Protection
+#[derive(Serialize, Deserialize, Debug, Clone)]
 struct AttestationReport {
     payload: HashMap<String, String>,
+    timestamp: u64,
+    nonce_hex: String,
     state_sha256: String,
     public_key_hex: String,
     signature_hex: String,
@@ -35,13 +40,13 @@ struct AttestationReport {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("=== Attestation Agent v0.4.0 (Ed25519 Crypto Engine) ===");
-    println!("[*] Querying Windows WMI and generating cryptographic signatures...");
+    println!("=== Attestation Agent v0.5.0 (High-Throughput Gateway Engine) ===");
+    println!("[*] Generating signed attestation payload with Anti-Replay protection...");
 
     let com_lib = COMLibrary::new()?;
     let mut payload = HashMap::new();
 
-    // 1. Gather System Info
+    // 1. Gather Telemetry
     if let Ok(sys_con) = WMIConnection::new(com_lib) {
         if let Ok(systems) = sys_con.raw_query::<ComputerSystem>("SELECT Name, Manufacturer, Model FROM Win32_ComputerSystem") {
             if let Some(sys) = systems.first() {
@@ -52,7 +57,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // 2. Gather TPM Info (Safely caught)
     let (tpm_present, tpm_ready) = match WMIConnection::with_namespace_path(r"root\CIMV2\Security\MicrosoftTpm", com_lib) {
         Ok(tpm_con) => {
             match tpm_con.raw_query::<TpmInfo>("SELECT IsPresent_Valid, IsEnabled_Valid, ManufacturerId FROM Win32_Tpm") {
@@ -73,38 +77,97 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     payload.insert("TpmPresent".to_string(), tpm_present.to_string());
     payload.insert("TpmReady".to_string(), tpm_ready.to_string());
 
-    // 3. Generate SHA-256 Digest of Payload
+    // 2. Generate Anti-Replay Parameters (Timestamp + 16-byte random Nonce)
+    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let mut nonce_bytes = [0u8; 16];
+    OsRng.fill_bytes(&mut nonce_bytes);
+    let nonce_hex = hex::encode(nonce_bytes);
+
+    // 3. Compute Cryptographic Hash incorporating Payload + Nonce + Timestamp
     let serialized_payload = serde_json::to_string(&payload)?;
     let mut hasher = Sha256::new();
     hasher.update(serialized_payload.as_bytes());
+    hasher.update(timestamp.to_be_bytes());
+    hasher.update(&nonce_bytes);
     let hash_bytes = hasher.finalize();
     let state_hash = hex::encode(hash_bytes);
 
-    // 4. Generate Ed25519 Keypair & Sign the State Hash
-    let mut csprng = OsRng;
-    let signing_key: SigningKey = SigningKey::generate(&mut csprng);
+    // 4. Generate Ed25519 Keypair & Sign state hash
+    let signing_key = SigningKey::generate(&mut OsRng);
     let verifying_key = signing_key.verifying_key();
-
     let signature = signing_key.sign(&hash_bytes);
 
-    // 5. Evaluate Posture
     let device_status = if tpm_present && tpm_ready {
         "TRUSTED_HARDWARE_HEALTHY".to_string()
     } else {
         "UNTRUSTED_TPM_RESTRICTED_OR_MISSING".to_string()
     };
 
-    // 6. Output Final Signed Attestation JSON
     let report = AttestationReport {
         payload,
+        timestamp,
+        nonce_hex,
         state_sha256: state_hash,
         public_key_hex: hex::encode(verifying_key.to_bytes()),
         signature_hex: hex::encode(signature.to_bytes()),
         device_status,
     };
 
-    println!("\n[+] Cryptographically Signed Attestation Report:");
+    println!("\n[+] Attestation Report Generated:");
     println!("{}", serde_json::to_string_pretty(&report)?);
 
+    // -------------------------------------------------------------------
+    // 5. SERVER-SIDE VERIFICATION GATEWAY (Simulated Remote Verifier)
+    // -------------------------------------------------------------------
+    println!("\n[=== SIMULATING REMOTE ENTERPRISE GATEWAY VERIFICATION ===]");
+    let is_valid = verify_attestation_report(&report);
+
+    if is_valid {
+        println!("[SUCCESS] Signature Valid! Hardware posture verified. Granting Session Access Token.");
+    } else {
+        println!("[ALERT] Signature or State Verification FAILED! Access Denied.");
+    }
+
     Ok(())
+}
+
+// Function executed on a high-throughput server/gateway to verify incoming agent reports
+fn verify_attestation_report(report: &AttestationReport) -> bool {
+    // A. Parse Public Key and Signature from Hex
+    let pub_key_bytes = match hex::decode(&report.public_key_hex) {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+    let sig_bytes = match hex::decode(&report.signature_hex) {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+
+    let verifying_key = match VerifyingKey::try_from(pub_key_bytes.as_slice()) {
+        Ok(k) => k,
+        Err(_) => return false,
+    };
+    let signature = match Signature::try_from(sig_bytes.as_slice()) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+
+    // B. Reconstruct the Hash Server-Side
+    let serialized_payload = match serde_json::to_string(&report.payload) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    let nonce_bytes = match hex::decode(&report.nonce_hex) {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+
+    let mut hasher = Sha256::new();
+    hasher.update(serialized_payload.as_bytes());
+    hasher.update(report.timestamp.to_be_bytes());
+    hasher.update(&nonce_bytes);
+    let expected_hash = hasher.finalize();
+
+    // C. Verify Mathematical Authenticity of the Signature
+    verifying_key.verify(&expected_hash, &signature).is_ok()
 }
